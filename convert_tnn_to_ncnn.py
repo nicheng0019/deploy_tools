@@ -165,7 +165,7 @@ def Softmax_convert(in_params):
     '''
     correspond_dict = OrderedDict({0: 0})
     correspond_dict[1] = "1"
-    out_params =correspond_param_convert(in_params, correspond_dict)
+    out_params = correspond_param_convert(in_params, correspond_dict)
 
     out_dict = {}
     out_dict["layer_type"] = "Softmax"
@@ -190,11 +190,68 @@ def InnerProduct_convert(in_params, **kwargs):
     return correspond_param_convert(in_params, correspond_dict)
 
 
+@register("PReLU")
+def PReLU_convert(in_params, **kwargs):
+    '''
+    tnn: channel_shared has_filler
+    ncnn: num_slope
+    '''
+    input_channel = kwargs["input_channel"]
+    if int(in_params[0]) == 1:
+        out_params = "0=1"
+    else:
+        out_params = "0=" + str(input_channel)
+    return out_params
+
+
+@register("Upsample")
+def Upsample_convert(in_params):
+    '''
+    tnn: mode scale_h scale_w align_corners
+    ncnn: resize_type height_scale width_scale output_height output_width dynamic_target_size align_corner
+    '''
+    correspond_dict = OrderedDict({0: 0, 1: 1, 2: 2, 6: 3})
+    out_params = correspond_param_convert(in_params, correspond_dict)
+    out_dict = {}
+    out_dict["layer_type"] = "Interp"
+    return [out_params, out_dict]
+
+
+@register("SplitV")
+def SplitV_convert(in_params):
+    '''
+    tnn: axis slice_count slice1 ...
+    ncnn: slices axis
+    '''
+    out_params = "1=" + str(int(in_params[0]) - 1) + " -23300="
+    slice_count = int(in_params[1])
+    out_params += str(slice_count)
+    for i in range(slice_count - 1):
+        out_params += "," + in_params[i + 2]
+
+    out_params += ",-233"
+
+    out_dict = {}
+    out_dict["layer_type"] = "Slice"
+
+    return [out_params, out_dict]
+
+
+@register("ShuffleChannel")
+def ShuffleChannel_convert(in_params):
+    '''
+    tnn: group
+    ncnn: group reverse
+    '''
+    correspond_dict = OrderedDict({0: 0})
+    return correspond_param_convert(in_params, correspond_dict)
+
+
 FIRST_PARAM_SPACE = 17
 SECOND_THIRD_INTERVAL = 19
 
 
-def convert_tnn_to_ncnn(tnn_file, ncnn_file, shape_file=None, input_channel=1):
+def convert_param(tnn_file, ncnn_file, shape_file=None, input_channel=1):
     shape_dict = {}
     if shape_file is not None:
         with open(shape_file) as fshape:
@@ -243,7 +300,7 @@ def convert_tnn_to_ncnn(tnn_file, ncnn_file, shape_file=None, input_channel=1):
             print("not support layer type: ", layer_type)
             continue
 
-        if layer_type == "Convolution" or layer_type == "InnerProduct":
+        if layer_type == "Convolution" or layer_type == "InnerProduct" or layer_type == "PReLU":
             if input_names[0] in shape_dict.keys():
                 input_channel = shape_dict[input_names[0]][1]
             output = CONVERT_FUNC[layer_type](layer_param, input_channel=input_channel)
@@ -329,15 +386,31 @@ def bytes_to_str(bytearr):
     return string
 
 
+def get_int(fmodel):
+    buff = fmodel.read(4)
+    return struct.unpack("i", buff)[0]
+
+
+def get_uint(fmodel):
+    buff = fmodel.read(4)
+    return struct.unpack("I", buff)[0]
+
+
+def get_str(fmodel, strlen):
+    buff = fmodel.read(strlen)
+    string = struct.unpack("c" * strlen, buff)
+    return bytes_to_str(string)
+
+
 def get_raw(fmodel):
-    magic_number = fmodel.read(4)
-    magic_number = struct.unpack("I", magic_number)[0]
+    magic_number = get_uint(fmodel)
+    data_type = get_int(fmodel)
+    length = get_int(fmodel)
 
-    data_type = fmodel.read(4)
-    data_type = struct.unpack("i", data_type)[0]
-
-    length = fmodel.read(4)
-    length = struct.unpack("i", length)[0]
+    if 4206624772 == magic_number:
+        size = get_int(fmodel)
+        for i in range(size):
+            dim = get_int(fmodel)
 
     buffer = fmodel.read(length)
     return buffer
@@ -345,14 +418,9 @@ def get_raw(fmodel):
 
 @register_res("Convolution")
 def Convolution_res_convert(fmodel):
-    layer_name_len = fmodel.read(4)
-    layer_name_len = struct.unpack("i", layer_name_len)[0]
-    layer_name = fmodel.read(layer_name_len)
-    layer_name = struct.unpack("c" * layer_name_len, layer_name)
-    layer_name = bytes_to_str(layer_name)
-
-    has_bias = fmodel.read(4)
-    has_bias = struct.unpack("i", has_bias)[0]
+    layer_name_len = get_int(fmodel)
+    layer_name = get_str(fmodel, layer_name_len)
+    has_bias = get_int(fmodel)
 
     filter_buffer = get_raw(fmodel)
 
@@ -369,11 +437,8 @@ def Convolution_res_convert(fmodel):
 
 @register_res("InnerProduct")
 def InnerProduct_res_convert(fmodel):
-    layer_name_len = fmodel.read(4)
-    layer_name_len = struct.unpack("i", layer_name_len)[0]
-    layer_name = fmodel.read(layer_name_len)
-    layer_name = struct.unpack("c" * layer_name_len, layer_name)
-    layer_name = bytes_to_str(layer_name)
+    layer_name_len = get_int(fmodel)
+    layer_name = get_str(fmodel, layer_name_len)
 
     filter_buffer = get_raw(fmodel)
 
@@ -389,27 +454,17 @@ def InnerProduct_res_convert(fmodel):
 def convert_model(tnn_model, ncnn_model, **kwargs):
     with open(ncnn_model, "wb") as fncnn:
         with open(tnn_model, "rb") as fmodel:
-            magic_version_number = fmodel.read(4)
-            magic_version_number = struct.unpack("I", magic_version_number)
-
-            layer_cnt = fmodel.read(4)
-            layer_cnt = struct.unpack("i", layer_cnt)[0]
+            magic_version_number = get_uint(fmodel)
+            layer_cnt = get_int(fmodel)
 
             for i in range(layer_cnt):
-                layer_type = fmodel.read(4)
-                layer_type = struct.unpack("i", layer_type)[0]
+                layer_type = get_int(fmodel)
 
-                type_str_len = fmodel.read(4)
-                type_str_len = struct.unpack("i", type_str_len)[0]
-                type_str = fmodel.read(type_str_len)
-                type_str = struct.unpack("c" * type_str_len, type_str)
-                type_str = bytes_to_str(type_str)
+                type_str_len = get_int(fmodel)
+                type_str = get_str(fmodel, type_str_len)
 
-                name_len = fmodel.read(4)
-                name_len = struct.unpack("i", name_len)[0]
-                name = fmodel.read(name_len)
-                name = struct.unpack("c" * name_len, name)
-                name = bytes_to_str(name)
+                name_len = get_int(fmodel)
+                name = get_str(fmodel, name_len)
 
                 if type_str not in RESOURCE_FUNC.keys():
                     print("Not supported", type_str)
@@ -426,14 +481,14 @@ def convert_model(tnn_model, ncnn_model, **kwargs):
 
 
 if __name__ == "__main__":
-    # convert_tnn_to_ncnn(r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase1.tnnproto",
+    # convert_param(r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase1.tnnproto",
     #     r"D:\Program\Project\ncnn-20220420\examples\youtu_face_alignment_phase1.param",
     #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase1_output_shape.txt")
     #
     # convert_model(r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase1.tnnmodel",
     #               r"D:\Program\Project\ncnn-20220420\examples\youtu_face_alignment_phase1.bin", filtered_layers=("853", ))
 
-    # convert_tnn_to_ncnn(
+    # convert_param(
     #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase2.tnnproto",
     #     r"D:\Program\Project\ncnn-20220420\examples\youtu_face_alignment_phase2.param",
     #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase2_output_shape.txt")
@@ -445,13 +500,21 @@ if __name__ == "__main__":
     """
     添加一行 Permute          351                   1 1 374 375 0=1
     """
-    convert_tnn_to_ncnn(
-        r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_Face_Detection\version-slim-320_simplified.tnnproto",
-        r"D:\Program\Project\ncnn-20220420\examples\version-slim-320_simplified.param",
-        r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_Face_Detection\version-slim-320_simplified_output_shape.txt", input_channel=3)
+    # convert_param(
+    #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_Face_Detection\version-slim-320_simplified.tnnproto",
+    #     r"D:\Program\Project\ncnn-20220420\examples\version-slim-320_simplified.param",
+    #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_Face_Detection\version-slim-320_simplified_output_shape.txt", input_channel=3)
+    #
+    # convert_model(
+    #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_Face_Detection\version-slim-320_simplified.tnnmodel",
+    #     r"D:\Program\Project\ncnn-20220420\examples\version-slim-320_simplified.bin")
+
+    convert_param(
+        r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.tnnproto",
+        r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.param",
+        r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m_output_shape.txt", input_channel=3)
 
     convert_model(
-        r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_Face_Detection\version-slim-320_simplified.tnnmodel",
-        r"D:\Program\Project\ncnn-20220420\examples\version-slim-320_simplified.bin")
-
+        r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.tnnmodel",
+        r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.bin")
 
