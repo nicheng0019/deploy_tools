@@ -55,16 +55,12 @@ def Convolution_convert(in_params, **kwargs):
     correspond_dict = OrderedDict({0: 2, 1: 4, 2: 12, 3: 6, 4: 8, 5: 9, 9: 13,
                                    11: 3, 12: 11, 13: 5, 14: 7})
 
-    input_channel = kwargs["input_channel"]
+    weight_data_size = kwargs["weight_data_size"]
+    correspond_dict[6] = str(weight_data_size)
     layer_type = "Convolution"
     if int(in_params[0]) > 1:
         layer_type = "ConvolutionDepthWise"
-        correspond_dict[6] = str(input_channel * int(in_params[3]) *
-                                 int(in_params[4]))
         correspond_dict[7] = in_params[2]
-    else:
-        correspond_dict[6] = str(input_channel * int(in_params[2]) * int(in_params[3]) *
-                                 int(in_params[4]))
 
     out_params = correspond_param_convert(in_params, correspond_dict)
 
@@ -127,12 +123,15 @@ def Permute_convert(in_params):
 @register("Reshape")
 def Reshape_convert(in_params):
     '''
-    tnn: axis num_axes top_blob_dim_size shape
+    tnn: axis num_axes top_blob_dim_size shape reshape_type
     ncnn: w h c permute 4 5 6 7 8 9 10 d
     '''
     top_blob_dim_size = int(in_params[2])
     if top_blob_dim_size == 4:
         correspond_dict = OrderedDict({0: 6, 1: 5, 2: 4})
+        return correspond_param_convert(in_params, correspond_dict)
+    elif top_blob_dim_size == 3:
+        correspond_dict = OrderedDict({0: 5, 1: 4})
         return correspond_param_convert(in_params, correspond_dict)
 
 
@@ -184,8 +183,8 @@ def InnerProduct_convert(in_params, **kwargs):
     ncnn: num_output bias_term weight_data_size int8_scale_term activation_type activation_params
     '''
     correspond_dict = OrderedDict({0: 0, 1: 1})
-    input_channel = kwargs["input_channel"]
-    correspond_dict[2] = str(int(in_params[0]) * input_channel)
+    weight_data_size = kwargs["weight_data_size"]
+    correspond_dict[2] = str(weight_data_size)#str(int(in_params[0]) * input_channel)
 
     return correspond_param_convert(in_params, correspond_dict)
 
@@ -196,11 +195,11 @@ def PReLU_convert(in_params, **kwargs):
     tnn: channel_shared has_filler
     ncnn: num_slope
     '''
-    input_channel = kwargs["input_channel"]
+    weight_data_size = kwargs["weight_data_size"]
     if int(in_params[0]) == 1:
         out_params = "0=1"
     else:
-        out_params = "0=" + str(input_channel)
+        out_params = "0=" + str(weight_data_size)
     return out_params
 
 
@@ -210,8 +209,12 @@ def Upsample_convert(in_params):
     tnn: mode scale_h scale_w align_corners
     ncnn: resize_type height_scale width_scale output_height output_width dynamic_target_size align_corner
     '''
-    correspond_dict = OrderedDict({0: 0, 1: 1, 2: 2, 6: 3})
+
+    correspond_dict = OrderedDict({0: 0, 6: 3})
     out_params = correspond_param_convert(in_params, correspond_dict)
+    out_params += " 1=" + '{:e}'.format(float(in_params[1]))
+    out_params += " 2=" + '{:e}'.format(float(in_params[2]))
+
     out_dict = {}
     out_dict["layer_type"] = "Interp"
     return [out_params, out_dict]
@@ -251,19 +254,7 @@ FIRST_PARAM_SPACE = 17
 SECOND_THIRD_INTERVAL = 19
 
 
-def convert_param(tnn_file, ncnn_file, shape_file=None, input_channel=1):
-    shape_dict = {}
-    if shape_file is not None:
-        with open(shape_file) as fshape:
-            shape_datas = fshape.readlines()
-
-        for data in shape_datas:
-            data = data.strip().split()
-            name = data[1]
-            shape = data[7:-1]
-            shape = list(map(int, shape))
-            shape_dict[name] = shape
-
+def convert_param(tnn_file, ncnn_file, weight_data_size_dict=None):
     with open(tnn_file) as tnn_proto:
         tnn_layers = tnn_proto.readlines()
 
@@ -301,9 +292,11 @@ def convert_param(tnn_file, ncnn_file, shape_file=None, input_channel=1):
             continue
 
         if layer_type == "Convolution" or layer_type == "InnerProduct" or layer_type == "PReLU":
-            if input_names[0] in shape_dict.keys():
-                input_channel = shape_dict[input_names[0]][1]
-            output = CONVERT_FUNC[layer_type](layer_param, input_channel=input_channel)
+            if layer_name not in weight_data_size_dict.keys():
+                print("weight_data_size is not found")
+
+            weight_data_size = weight_data_size_dict[layer_name]
+            output = CONVERT_FUNC[layer_type](layer_param, weight_data_size=weight_data_size)
         else:
             output = CONVERT_FUNC[layer_type](layer_param)
         if output is None:
@@ -423,6 +416,7 @@ def Convolution_res_convert(fmodel):
     has_bias = get_int(fmodel)
 
     filter_buffer = get_raw(fmodel)
+    filter_len = len(filter_buffer) // 4
 
     flag_struct = 0
     flag_struct_buffer = struct.pack("I", flag_struct)
@@ -432,7 +426,7 @@ def Convolution_res_convert(fmodel):
     if has_bias:
         bias_buffer = get_raw(fmodel)
 
-    return filter_buffer + bias_buffer
+    return (filter_buffer + bias_buffer, filter_len)
 
 
 @register_res("InnerProduct")
@@ -441,6 +435,7 @@ def InnerProduct_res_convert(fmodel):
     layer_name = get_str(fmodel, layer_name_len)
 
     filter_buffer = get_raw(fmodel)
+    filter_len = len(filter_buffer) // 4
 
     flag_struct = 0
     flag_struct_buffer = struct.pack("I", flag_struct)
@@ -448,10 +443,26 @@ def InnerProduct_res_convert(fmodel):
 
     bias_buffer = get_raw(fmodel)
 
-    return filter_buffer + bias_buffer
+    return (filter_buffer + bias_buffer, filter_len)
+
+
+@register_res("PReLU")
+def PReLU_res_convert(fmodel):
+    layer_name_len = get_int(fmodel)
+    layer_name = get_str(fmodel, layer_name_len)
+
+    slope_buffer = get_raw(fmodel)
+    slope_len = len(slope_buffer) // 4
+
+    flag_struct = 0
+    flag_struct_buffer = struct.pack("I", flag_struct)
+    slope_buffer = flag_struct_buffer + slope_buffer
+
+    return (slope_buffer, slope_len)
 
 
 def convert_model(tnn_model, ncnn_model, **kwargs):
+    weight_data_size_dict = {}
     with open(ncnn_model, "wb") as fncnn:
         with open(tnn_model, "rb") as fmodel:
             magic_version_number = get_uint(fmodel)
@@ -477,16 +488,21 @@ def convert_model(tnn_model, ncnn_model, **kwargs):
                         print("filtered ", name)
                         continue
 
-                fncnn.write(buffer)
+                if isinstance(buffer, tuple):
+                    buffer, weight_data_size = buffer
+                    weight_data_size_dict[name] = weight_data_size
 
+                fncnn.write(buffer)
+    return weight_data_size_dict
 
 if __name__ == "__main__":
-    # convert_param(r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase1.tnnproto",
-    #     r"D:\Program\Project\ncnn-20220420\examples\youtu_face_alignment_phase1.param",
-    #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase1_output_shape.txt")
-    #
-    # convert_model(r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase1.tnnmodel",
-    #               r"D:\Program\Project\ncnn-20220420\examples\youtu_face_alignment_phase1.bin", filtered_layers=("853", ))
+    weight_data_size_dict = convert_model(
+        r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase1.tnnmodel",
+        r"youtu_face_alignment_phase1_new.bin", filtered_layers=("853",))
+
+    convert_param(r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase1.tnnproto",
+        r"youtu_face_alignment_phase1_new.param", weight_data_size_dict)
+
 
     # convert_param(
     #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_face_alignment\youtu_face_alignment_phase2.tnnproto",
@@ -503,18 +519,18 @@ if __name__ == "__main__":
     # convert_param(
     #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_Face_Detection\version-slim-320_simplified.tnnproto",
     #     r"D:\Program\Project\ncnn-20220420\examples\version-slim-320_simplified.param",
-    #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_Face_Detection\version-slim-320_simplified_output_shape.txt", input_channel=3)
+    #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_Face_Detection\version-slim-320_simplified_output_shape.txt")
     #
     # convert_model(
     #     r"D:\Program\Project\ncnn-20210322\examples\ncnn_examples\TNN_Face_Detection\version-slim-320_simplified.tnnmodel",
     #     r"D:\Program\Project\ncnn-20220420\examples\version-slim-320_simplified.bin")
 
-    convert_param(
-        r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.tnnproto",
-        r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.param",
-        r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m_output_shape.txt", input_channel=3)
-
-    convert_model(
-        r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.tnnmodel",
-        r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.bin")
+    # convert_param(
+    #     r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.tnnproto",
+    #     r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.param",
+    #     r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m_output_shape.txt", input_channel=3)
+    #
+    # convert_model(
+    #     r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.tnnmodel",
+    #     r"D:\Program\Project\TNN-master\examples\tnn-models-master\model\nanodet\nanodet_m.bin")
 
